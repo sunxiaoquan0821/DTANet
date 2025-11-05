@@ -31,20 +31,15 @@ class DTA256(nn.Module):
         self.k = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
         self.v = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
 
-        #######conv1
         self.conv1_2ch_1ch = nn.Conv2d(planes+inplanes, planes, kernel_size=1, stride=1)
         # self.conv1_4ch_1ch= nn.Conv2d(planes*4, planes, kernel_size=1, stride=1)
-
         self.conv1_1ch_1ch = nn.Conv2d(inplanes,inplanes, kernel_size=1, stride=1)
-
-        #######conv3
         self.convout = nn.Conv2d(planes, inplanes, kernel_size=3, stride=1,padding=1)
 
-        #######bn
         self.bnout = nn.BatchNorm2d(inplanes)
         # self.bn2ch = nn.BatchNorm2d(planes * 2)
         self.bn = nn.BatchNorm2d(planes)
-
+        
         self.linearh = nn.Linear(1, 32)
         self.linearH = nn.Linear(1, 64)
         self.avg_down = nn.AdaptiveAvgPool2d((1, 1))
@@ -93,82 +88,19 @@ class DTA256(nn.Module):
         x21_B_D_hwLG = torch.cat([x21_B_D_hw, LT3_B_D_1, GT_B_D_1 ], dim=2)
         x22_B_D_hwLG = torch.cat([x22_B_D_hw, LT4_B_D_1, GT_B_D_1 ], dim=2)
 
-        # x11_B_hwLG_D = x11_B_D_hwLG.contiguous().permute(0, 2, 1)
-        # x12_B_hwLG_D = x12_B_D_hwLG.contiguous().permute(0, 2, 1)
-        # x21_B_hwLG_D = x21_B_D_hwLG.contiguous().permute(0, 2, 1)
-        # x22_B_hwLG_D = x22_B_D_hwLG.contiguous().permute(0, 2, 1)
+        x11_B_hwLG_D = x11_B_D_hwLG.contiguous().permute(0, 2, 1)
+        x12_B_hwLG_D = x12_B_D_hwLG.contiguous().permute(0, 2, 1)
+        x21_B_hwLG_D = x21_B_D_hwLG.contiguous().permute(0, 2, 1)
+        x22_B_hwLG_D = x22_B_D_hwLG.contiguous().permute(0, 2, 1)
 
-############################att
 
-        # x11_B_hwLG_hwLG = torch.bmm(torch.relu(x11_B_hwLG_D),torch.relu(x11_B_D_hwLG))
-        # x11_B_hwLG_hwLG_ = x11_B_hwLG_hwLG/2
-        # d11 = torch.sum(x11_B_hwLG_hwLG_,dim=1)
-        # d11[d11 !=0]= torch.sqrt(1.0/d11[d11 !=0])
-        # x11_B_hwLG_hwLG_ *= d11.unsqueeze(1)
-        # x11_B_hwLG_hwLG_ *= d11.unsqueeze(2)
-        # x11_B_hwLG_D = torch.bmm(x11_B_hwLG_hwLG_, x11_B_hwLG_D)
-        # x11_B_D_hwLG_out = x11_B_hwLG_D.contiguous().permute(0, 2, 1)
-        #
-        #
-        # x12_B_hwLG_hwLG = torch.bmm(torch.relu(x12_B_hwLG_D),torch.relu(x12_B_D_hwLG))
-        # x12_B_hwLG_hwLG_ = x12_B_hwLG_hwLG/2
-        # d12 = torch.sum(x12_B_hwLG_hwLG_,dim=1)
-        # d12[d12 !=0]= torch.sqrt(1.0/d12[d12 !=0])
-        # x12_B_hwLG_hwLG_ *= d12.unsqueeze(1)
-        # x12_B_hwLG_hwLG_ *= d12.unsqueeze(2)
-        # x12_B_hwLG_D = torch.bmm(x12_B_hwLG_hwLG_, x12_B_hwLG_D)
-        # x12_B_D_hwLG_out = x12_B_hwLG_D.contiguous().permute(0, 2, 1)
-        #
-        # x21_B_hwLG_hwLG = torch.bmm(torch.relu(x21_B_hwLG_D),torch.relu(x21_B_D_hwLG))
-        # x21_B_hwLG_hwLG_ = x21_B_hwLG_hwLG/2
-        # d21 = torch.sum(x21_B_hwLG_hwLG_,dim=1)
-        # d21[d21 !=0]= torch.sqrt(1.0/d21[d21 !=0])
-        # x21_B_hwLG_hwLG_ *= d21.unsqueeze(1)
-        # x21_B_hwLG_hwLG_ *= d21.unsqueeze(2)
-        # x21_B_hwLG_D = torch.bmm(x21_B_hwLG_hwLG_, x21_B_hwLG_D)
-        # x21_B_D_hwLG_out = x21_B_hwLG_D.contiguous().permute(0, 2, 1)
-        #
-        # x22_B_hwLG_hwLG = torch.bmm(torch.relu(x22_B_hwLG_D),torch.relu(x22_B_D_hwLG))
-        # x22_B_hwLG_hwLG_ = x22_B_hwLG_hwLG/2
-        # d22 = torch.sum(x22_B_hwLG_hwLG_,dim=1)
-        # d22[d22 !=0]= torch.sqrt(1.0/d22[d22 !=0])
-        # x22_B_hwLG_hwLG_ *= d22.unsqueeze(1)
-        # x22_B_hwLG_hwLG_ *= d22.unsqueeze(2)
-        # x22_B_hwLG_D = torch.bmm(x22_B_hwLG_hwLG_, x22_B_hwLG_D)
-        # x22_B_D_hwLG_out = x22_B_hwLG_D.contiguous().permute(0, 2, 1)
-
-        ######################### single_layer
+        ######################### 
         x11_B_D_hwLG_out = self.GLTATT(x11_B_D_hwLG)
         x12_B_D_hwLG_out = self.GLTATT(x12_B_D_hwLG)
         x21_B_D_hwLG_out = self.GLTATT(x21_B_D_hwLG)
         x22_B_D_hwLG_out = self.GLTATT(x22_B_D_hwLG)
 
-        ######################### double_layer
-        # x11_B_D_hwLG_out1 = self.GLTATT(x11_B_D_hwLG)
-        # x12_B_D_hwLG_out1 = self.GLTATT(x12_B_D_hwLG)
-        # x21_B_D_hwLG_out1 = self.GLTATT(x21_B_D_hwLG)
-        # x22_B_D_hwLG_out1 = self.GLTATT(x22_B_D_hwLG)
-        #
-        # x11_B_D_hwLG_out = self.GLTATT(x11_B_D_hwLG_out1)
-        # x12_B_D_hwLG_out = self.GLTATT(x12_B_D_hwLG_out1)
-        # x21_B_D_hwLG_out = self.GLTATT(x21_B_D_hwLG_out1)
-        # x22_B_D_hwLG_out = self.GLTATT(x22_B_D_hwLG_out1)
 
-        ######################### 3_layer
-        # x11_B_D_hwLG_out1 = self.GLTATT(x11_B_D_hwLG)
-        # x12_B_D_hwLG_out1 = self.GLTATT(x12_B_D_hwLG)
-        # x21_B_D_hwLG_out1 = self.GLTATT(x21_B_D_hwLG)
-        # x22_B_D_hwLG_out1 = self.GLTATT(x22_B_D_hwLG)
-        #
-        # x11_B_D_hwLG_out2 = self.GLTATT(x11_B_D_hwLG_out1)
-        # x12_B_D_hwLG_out2 = self.GLTATT(x12_B_D_hwLG_out1)
-        # x21_B_D_hwLG_out2 = self.GLTATT(x21_B_D_hwLG_out1)
-        # x22_B_D_hwLG_out2 = self.GLTATT(x22_B_D_hwLG_out1)
-        #
-        # x11_B_D_hwLG_out = self.GLTATT(x11_B_D_hwLG_out2)
-        # x12_B_D_hwLG_out = self.GLTATT(x12_B_D_hwLG_out2)
-        # x21_B_D_hwLG_out = self.GLTATT(x21_B_D_hwLG_out2)
-        # x22_B_D_hwLG_out = self.GLTATT(x22_B_D_hwLG_out2)
 
 
 
@@ -199,38 +131,7 @@ class DTA256(nn.Module):
 
         GT1234_out_B_D_4_H = torch.cat([GT1_out_B_D_1_H, GT2_out_B_D_1_H,GT3_out_B_D_1_H,GT4_out_B_D_1_H], dim=2)
         GT_out_B_D_4_H = self.conv1_1ch_1ch(GT1234_out_B_D_4_H)
-        # ########################## GT
-        # GT1_out_B_D_1_1 = GT1_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        # GT1_out_B_D_1_W = self.linearH(GT1_out_B_D_1_1)
-        # GT1_out_B_D_1_H = self.linearH(GT1_out_B_D_1_1)
-        # GT1_out_B_D_H_1 = GT1_out_B_D_1_H.view(b,c,H,1)
-        # GT1_out_B_D_H_W = GT1_out_B_D_H_1 * GT1_out_B_D_1_W
-        # #GT1_out_B_D_H_W_sigmoid = self.sigmoid(GT1_out_B_D_H_W)
-        #
-        # GT2_out_B_D_1_1 = GT2_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        # GT2_out_B_D_1_W = self.linearH(GT2_out_B_D_1_1)
-        # GT2_out_B_D_1_H = self.linearH(GT2_out_B_D_1_1)
-        # GT2_out_B_D_H_1 = GT2_out_B_D_1_H.view(b,c,H,1)
-        # GT2_out_B_D_H_W = GT2_out_B_D_H_1 * GT2_out_B_D_1_W
-        # #GT2_out_B_D_H_W_sigmoid = self.sigmoid(GT2_out_B_D_H_W)
-        #
-        # GT3_out_B_D_1_1 = GT3_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        # GT3_out_B_D_1_W = self.linearH(GT3_out_B_D_1_1)
-        # GT3_out_B_D_1_H = self.linearH(GT3_out_B_D_1_1)
-        # GT3_out_B_D_H_1 = GT3_out_B_D_1_H.view(b,c,H,1)
-        # GT3_out_B_D_H_W = GT3_out_B_D_H_1 * GT3_out_B_D_1_W
-        # #GT3_out_B_D_H_W_sigmoid = self.sigmoid(GT3_out_B_D_H_W)
-        #
-        # GT4_out_B_D_1_1 = GT4_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        # GT4_out_B_D_1_W = self.linearH(GT4_out_B_D_1_1)
-        # GT4_out_B_D_1_H = self.linearH(GT4_out_B_D_1_1)
-        # GT4_out_B_D_H_1 = GT4_out_B_D_1_H.view(b,c,H,1)
-        # GT4_out_B_D_H_W = GT4_out_B_D_H_1 * GT4_out_B_D_1_W
-        # #GT4_out_B_D_H_W_sigmoid = self.sigmoid(GT4_out_B_D_H_W)
-        #
-        # GT1234_out_B_D_H_W = torch.cat([GT1_out_B_D_H_W, GT2_out_B_D_H_W,GT3_out_B_D_H_W,GT4_out_B_D_H_W], dim=1)
-        # GT_out_B_D_H_W = self.conv1_4ch_1ch(GT1234_out_B_D_H_W)
-        # GT_out_B_D_H_W_sigmoid = self.sigmoid(GT_out_B_D_H_W)
+        # ########################## 
 
         ########################## LT
         LT1_out_B_D_1_1 = LT1_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
@@ -305,14 +206,10 @@ class DTA512(nn.Module):
         self.k = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
         self.v = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
 
-        #######conv1
         self.conv1_2ch_1ch = nn.Conv2d(planes + inplanes, planes, kernel_size=1, stride=1)
         # self.conv1_4ch_1ch = nn.Conv2d(planes * 4, planes, kernel_size=1, stride=1)
         self.conv1_1ch_1ch = nn.Conv2d(inplanes,inplanes, kernel_size=1, stride=1)
-        #######conv3
         self.convout = nn.Conv2d(planes, inplanes, kernel_size=3, stride=1, padding=1)
-
-        #######bn
         self.bnout = nn.BatchNorm2d(inplanes)
         # self.bn2ch = nn.BatchNorm2d(planes * 2)
         self.bn = nn.BatchNorm2d(planes)
@@ -364,38 +261,12 @@ class DTA512(nn.Module):
         x22_B_D_hwLG = torch.cat([x22_B_D_hw, LT4_B_D_1, GT_B_D_1], dim=2)
 
 
-        ######################### single_layer
+        ######################### 
         x11_B_D_hwLG_out = self.GLTATT(x11_B_D_hwLG)
         x12_B_D_hwLG_out = self.GLTATT(x12_B_D_hwLG)
         x21_B_D_hwLG_out = self.GLTATT(x21_B_D_hwLG)
         x22_B_D_hwLG_out = self.GLTATT(x22_B_D_hwLG)
 
-        ######################### double_layer
-        # x11_B_D_hwLG_out1 = self.GLTATT(x11_B_D_hwLG)
-        # x12_B_D_hwLG_out1 = self.GLTATT(x12_B_D_hwLG)
-        # x21_B_D_hwLG_out1 = self.GLTATT(x21_B_D_hwLG)
-        # x22_B_D_hwLG_out1 = self.GLTATT(x22_B_D_hwLG)
-        #
-        # x11_B_D_hwLG_out = self.GLTATT(x11_B_D_hwLG_out1)
-        # x12_B_D_hwLG_out = self.GLTATT(x12_B_D_hwLG_out1)
-        # x21_B_D_hwLG_out = self.GLTATT(x21_B_D_hwLG_out1)
-        # x22_B_D_hwLG_out = self.GLTATT(x22_B_D_hwLG_out1)
-
-        ######################### 3_layer
-        # x11_B_D_hwLG_out1 = self.GLTATT(x11_B_D_hwLG)
-        # x12_B_D_hwLG_out1 = self.GLTATT(x12_B_D_hwLG)
-        # x21_B_D_hwLG_out1 = self.GLTATT(x21_B_D_hwLG)
-        # x22_B_D_hwLG_out1 = self.GLTATT(x22_B_D_hwLG)
-        #
-        # x11_B_D_hwLG_out2 = self.GLTATT(x11_B_D_hwLG_out1)
-        # x12_B_D_hwLG_out2 = self.GLTATT(x12_B_D_hwLG_out1)
-        # x21_B_D_hwLG_out2 = self.GLTATT(x21_B_D_hwLG_out1)
-        # x22_B_D_hwLG_out2 = self.GLTATT(x22_B_D_hwLG_out1)
-        #
-        # x11_B_D_hwLG_out = self.GLTATT(x11_B_D_hwLG_out2)
-        # x12_B_D_hwLG_out = self.GLTATT(x12_B_D_hwLG_out2)
-        # x21_B_D_hwLG_out = self.GLTATT(x21_B_D_hwLG_out2)
-        # x22_B_D_hwLG_out = self.GLTATT(x22_B_D_hwLG_out2)
 
 
 
@@ -503,11 +374,10 @@ class DTA1024(nn.Module):
         self.k = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
         self.v = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
 
-        #######conv1
+
         self.conv1_2ch_1ch = nn.Conv2d(planes+inplanes, planes, kernel_size=1, stride=1)
         # self.conv1_4ch_1ch= nn.Conv2d(planes*4, planes, kernel_size=1, stride=1)
         self.conv1_1ch_1ch = nn.Conv2d(inplanes,inplanes, kernel_size=1, stride=1)
-        #######conv3
         self.convout = nn.Conv2d(planes, inplanes, kernel_size=3, stride=1,padding=1)
 
         #######bn
@@ -562,39 +432,11 @@ class DTA1024(nn.Module):
         x22_B_D_hwLG = torch.cat([x22_B_D_hw, LT4_B_D_1, GT_B_D_1], dim=2)
 
 
-        ######################### single_layer
+        ######################### 
         x11_B_D_hwLG_out = self.GLTATT(x11_B_D_hwLG)
         x12_B_D_hwLG_out = self.GLTATT(x12_B_D_hwLG)
         x21_B_D_hwLG_out = self.GLTATT(x21_B_D_hwLG)
         x22_B_D_hwLG_out = self.GLTATT(x22_B_D_hwLG)
-
-        ######################### double_layer
-        # x11_B_D_hwLG_out1 = self.GLTATT(x11_B_D_hwLG)
-        # x12_B_D_hwLG_out1 = self.GLTATT(x12_B_D_hwLG)
-        # x21_B_D_hwLG_out1 = self.GLTATT(x21_B_D_hwLG)
-        # x22_B_D_hwLG_out1 = self.GLTATT(x22_B_D_hwLG)
-        #
-        # x11_B_D_hwLG_out = self.GLTATT(x11_B_D_hwLG_out1)
-        # x12_B_D_hwLG_out = self.GLTATT(x12_B_D_hwLG_out1)
-        # x21_B_D_hwLG_out = self.GLTATT(x21_B_D_hwLG_out1)
-        # x22_B_D_hwLG_out = self.GLTATT(x22_B_D_hwLG_out1)
-
-        ######################### 3_layer
-        # x11_B_D_hwLG_out1 = self.GLTATT(x11_B_D_hwLG)
-        # x12_B_D_hwLG_out1 = self.GLTATT(x12_B_D_hwLG)
-        # x21_B_D_hwLG_out1 = self.GLTATT(x21_B_D_hwLG)
-        # x22_B_D_hwLG_out1 = self.GLTATT(x22_B_D_hwLG)
-        #
-        # x11_B_D_hwLG_out2 = self.GLTATT(x11_B_D_hwLG_out1)
-        # x12_B_D_hwLG_out2 = self.GLTATT(x12_B_D_hwLG_out1)
-        # x21_B_D_hwLG_out2 = self.GLTATT(x21_B_D_hwLG_out1)
-        # x22_B_D_hwLG_out2 = self.GLTATT(x22_B_D_hwLG_out1)
-        #
-        # x11_B_D_hwLG_out = self.GLTATT(x11_B_D_hwLG_out2)
-        # x12_B_D_hwLG_out = self.GLTATT(x12_B_D_hwLG_out2)
-        # x21_B_D_hwLG_out = self.GLTATT(x21_B_D_hwLG_out2)
-        # x22_B_D_hwLG_out = self.GLTATT(x22_B_D_hwLG_out2)
-
 
 
         x11_out_B_D_hw, LT1_out_B_D_1, GT1_out_B_D_1 = torch.split(x11_B_D_hwLG_out, [h*w, 1, 1], dim=2)
