@@ -1,533 +1,205 @@
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-class GLTATT(nn.Module):
-    def __init__(self, in_ch):
-        super(GLTATT, self).__init__()
 
-    def forward(self, input):
+class MHSA(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int = 8, bias: bool = True, dropout: float = 0.0):
+        super().__init__()
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
 
-        input_B_D_hwLG = input
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout(dropout)
 
-        input_B_hwLG_D = input_B_D_hwLG.contiguous().permute(0, 2, 1)
-        input_B_hwLG_hwLG = torch.bmm(torch.relu(input_B_hwLG_D),torch.relu(input_B_D_hwLG))
-        input_B_hwLG_hwLG_ = input_B_hwLG_hwLG/2
-        d = torch.sum(input_B_hwLG_hwLG_,dim=1)
-        d[d !=0]= torch.sqrt(1.0/d[d !=0])
-        input_B_hwLG_hwLG_ *= d.unsqueeze(1)
-        input_B_hwLG_hwLG_ *= d.unsqueeze(2)
-        input_B_hwLG_D = torch.bmm(input_B_hwLG_hwLG_, input_B_hwLG_D)
-        input_B_D_hwLG_out = input_B_hwLG_D.contiguous().permute(0, 2, 1)
+    def forward(self, x_b_c_t: torch.Tensor) -> torch.Tensor:
+        B, C, T = x_b_c_t.shape
+        x = x_b_c_t.permute(0, 2, 1).contiguous()
 
-        out = input_B_D_hwLG_out
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
 
+        def split_heads(t):
+            return t.view(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
+
+        q = split_heads(q)
+        k = split_heads(k)
+        v = split_heads(v)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+
+        out = torch.matmul(attn, v)
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, -1, C)
+
+        out = self.out_proj(out)
+        out = self.proj_drop(out)
+
+        out = (out + x).permute(0, 2, 1).contiguous()
         return out
 
-class DTA256(nn.Module):
-    def __init__(self, inplanes,planes):
-        super(DTA256, self).__init__()
 
-        self.q = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
-        self.k = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
-        self.v = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
+class BaseDTA(nn.Module):
+    """
+    Pure DTA Block that maps X -> F_out with the same channel count.
+    Pre-Conv and Post-Conv with residual concat are handled outside this block.
+    Assumptions:
+      - The feature map is split into 4 windows: h = H/2, w = W/2 (n=4).
+      - linear_h_dim = h = w; linear_H_dim = H at this scale.
+    """
+    def __init__(self, inplanes: int,
+                 linear_h_dim: int, linear_H_dim: int,
+                 num_heads: int = 8, dropout: float = 0.0):
+        super().__init__()
 
-        self.conv1_2ch_1ch = nn.Conv2d(planes+inplanes, planes, kernel_size=1, stride=1)
-        # self.conv1_4ch_1ch= nn.Conv2d(planes*4, planes, kernel_size=1, stride=1)
-        self.conv1_1ch_1ch = nn.Conv2d(inplanes,inplanes, kernel_size=1, stride=1)
-        self.convout = nn.Conv2d(planes, inplanes, kernel_size=3, stride=1,padding=1)
+        # Token projectors for Local Tokens Up-sample
+        self.linear_row = nn.Linear(1, linear_h_dim, bias=True)
+        self.linear_col = nn.Linear(1, linear_h_dim, bias=True)
 
-        self.bnout = nn.BatchNorm2d(inplanes)
-        # self.bn2ch = nn.BatchNorm2d(planes * 2)
-        self.bn = nn.BatchNorm2d(planes)
-        
-        self.linearh = nn.Linear(1, 32)
-        self.linearH = nn.Linear(1, 64)
-        self.avg_down = nn.AdaptiveAvgPool2d((1, 1))
+        # Global Token expansion and fusion
+        self.linear_GT = nn.Linear(1, linear_H_dim, bias=True)
+        self.conv_fuse_GT = nn.Conv2d(inplanes, inplanes, kernel_size=1, stride=1, padding=0)
+
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.sigmoid = nn.Sigmoid()
 
-        self.GLTATT = GLTATT(256)
+        self.mhsa = MHSA(embed_dim=inplanes, num_heads=num_heads, dropout=dropout)
+        self.attn_dropout = nn.Dropout(dropout)
 
+        self.linear_h_dim = linear_h_dim
+        self.linear_H_dim = linear_H_dim
 
-    def forward(self,x):
+    @staticmethod
+    def _pad_to_even(x: torch.Tensor):
+        B, C, H, W = x.shape
+        pad_h = H % 2
+        pad_w = W % 2
+        if pad_h != 0 or pad_w != 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
+        return x, (pad_h, pad_w)
 
-        residual = x
-        b, c, H, W = x.size()
+    @staticmethod
+    def _crop(x: torch.Tensor, pad_hw):
+        pad_h, pad_w = pad_hw
+        if pad_h == 0 and pad_w == 0:
+            return x
+        _, _, H, W = x.shape
+        return x[:, :, :H - pad_h, :W - pad_w]
 
-        GT_B_D_1_1 = self.avg_down(x) #BD11
+    def _local_mhsa(self, y_in_b_c_t: torch.Tensor) -> torch.Tensor:
+        return self.mhsa(y_in_b_c_t)
 
-        x_ = torch.chunk(x, 2, dim=2)
-        x1_ = x_[0]
-        x2_ = x_[1]
-        x1_12_ = torch.chunk(x1_, 2, dim=3)
-        x11_ = x1_12_[0]
-        x12_ = x1_12_[1]
-        x2_12_ = torch.chunk(x2_, 2, dim=3)
-        x21_ = x2_12_[0]
-        x22_ = x2_12_[1]
+    def _local_token_upsample(self, lt_b_c_1_1: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        B, C, _, _ = lt_b_c_1_1.shape
+        assert h == self.linear_h_dim and w == self.linear_h_dim, "window size must match linear_h_dim"
+        row = self.linear_row(lt_b_c_1_1).view(B, C, h, 1)
+        col = self.linear_col(lt_b_c_1_1).view(B, C, 1, w)
+        w_lt = self.sigmoid(row * col)
+        return w_lt
 
-        x11_b, x11_c, h, w = x11_.size()
+    def _global_token_attention(self, f_wlt: torch.Tensor, gt_tokens_list, H: int, W: int) -> torch.Tensor:
+        B, C, _, _ = f_wlt.shape
+        assert H == self.linear_H_dim, "H must match linear_H_dim for GT expansion"
 
-        LT1_B_D_1_1 = self.avg_down(x11_)  #BD11
-        LT2_B_D_1_1 = self.avg_down(x12_)
-        LT3_B_D_1_1 = self.avg_down(x21_)
-        LT4_B_D_1_1 = self.avg_down(x22_)
+        gt_expanded = []
+        for gt_i in gt_tokens_list:
+            gt_1_1 = gt_i.view(B, C, 1, 1)
+            gt_h = self.linear_GT(gt_1_1)
+            gt_h = gt_h.permute(0, 1, 3, 2).contiguous()
+            gt_expanded.append(gt_h)
 
-        GT_B_D_1 = GT_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
-        LT1_B_D_1 = LT1_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
-        LT2_B_D_1 = LT2_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
-        LT3_B_D_1 = LT3_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
-        LT4_B_D_1 = LT4_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
+        w_gt_cat = torch.cat(gt_expanded, dim=3)
+        w_gt = self.conv_fuse_GT(w_gt_cat)
 
-        x11_B_D_hw = x11_.contiguous().view(x11_b, x11_c, -1)
-        x12_B_D_hw = x12_.contiguous().view(x11_b, x11_c, -1)
-        x21_B_D_hw = x21_.contiguous().view(x11_b, x11_c, -1)
-        x22_B_D_hw = x22_.contiguous().view(x11_b, x11_c, -1)
+        q = f_wlt.view(B, C, -1).permute(0, 2, 1).contiguous()
+        k = w_gt.view(B, C, -1).permute(0, 2, 1).contiguous()
+        v = k
 
-        x11_B_D_hwLG = torch.cat([x11_B_D_hw, LT1_B_D_1, GT_B_D_1 ], dim=2)
-        x12_B_D_hwLG = torch.cat([x12_B_D_hw, LT2_B_D_1, GT_B_D_1 ], dim=2)
-        x21_B_D_hwLG = torch.cat([x21_B_D_hw, LT3_B_D_1, GT_B_D_1 ], dim=2)
-        x22_B_D_hwLG = torch.cat([x22_B_D_hw, LT4_B_D_1, GT_B_D_1 ], dim=2)
+        attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(C)
+        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_dropout(attn)
 
-        x11_B_hwLG_D = x11_B_D_hwLG.contiguous().permute(0, 2, 1)
-        x12_B_hwLG_D = x12_B_D_hwLG.contiguous().permute(0, 2, 1)
-        x21_B_hwLG_D = x21_B_D_hwLG.contiguous().permute(0, 2, 1)
-        x22_B_hwLG_D = x22_B_D_hwLG.contiguous().permute(0, 2, 1)
-
-
-        ######################### 
-        x11_B_D_hwLG_out = self.GLTATT(x11_B_D_hwLG)
-        x12_B_D_hwLG_out = self.GLTATT(x12_B_D_hwLG)
-        x21_B_D_hwLG_out = self.GLTATT(x21_B_D_hwLG)
-        x22_B_D_hwLG_out = self.GLTATT(x22_B_D_hwLG)
-
-
-
-
-
-
-
-        x11_out_B_D_hw,LT1_out_B_D_1,GT1_out_B_D_1 = torch.split(x11_B_D_hwLG_out, [h*w, 1, 1], dim=2)
-        x12_out_B_D_hw,LT2_out_B_D_1,GT2_out_B_D_1 = torch.split(x12_B_D_hwLG_out, [h*w, 1, 1], dim=2)
-        x21_out_B_D_hw,LT3_out_B_D_1,GT3_out_B_D_1 = torch.split(x21_B_D_hwLG_out, [h*w, 1, 1], dim=2)
-        x22_out_B_D_hw,LT4_out_B_D_1,GT4_out_B_D_1 = torch.split(x22_B_D_hwLG_out, [h*w, 1, 1], dim=2)
-
-        x11_out_B_D_h_w = x11_out_B_D_hw.view(b, c, h, w)
-        x12_out_B_D_h_w = x12_out_B_D_hw.view(b, c, h, w)
-        x21_out_B_D_h_w = x21_out_B_D_hw.view(b, c, h, w)
-        x22_out_B_D_h_w = x22_out_B_D_hw.view(b, c, h, w)
-
-        ########################## GT
-        GT1_out_B_D_1_1 = GT1_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        GT2_out_B_D_1_1 = GT2_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        GT3_out_B_D_1_1 = GT3_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        GT4_out_B_D_1_1 = GT4_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-
-
-        GT1_out_B_D_1_H = self.linearH(GT1_out_B_D_1_1)
-        GT2_out_B_D_1_H = self.linearH(GT2_out_B_D_1_1)
-        GT3_out_B_D_1_H = self.linearH(GT3_out_B_D_1_1)
-        GT4_out_B_D_1_H = self.linearH(GT4_out_B_D_1_1)
-
-
-        GT1234_out_B_D_4_H = torch.cat([GT1_out_B_D_1_H, GT2_out_B_D_1_H,GT3_out_B_D_1_H,GT4_out_B_D_1_H], dim=2)
-        GT_out_B_D_4_H = self.conv1_1ch_1ch(GT1234_out_B_D_4_H)
-        # ########################## 
-
-        ########################## LT
-        LT1_out_B_D_1_1 = LT1_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        LT1_out_B_D_1_w = self.linearh(LT1_out_B_D_1_1)
-        LT1_out_B_D_1_h = self.linearh(LT1_out_B_D_1_1)
-        LT1_out_B_D_h_1 = LT1_out_B_D_1_h.view(b,c,h,1)
-        LT1_out_B_D_h_w = LT1_out_B_D_h_1 * LT1_out_B_D_1_w
-        LT1_out_B_D_h_w_sigmoid = self.sigmoid(LT1_out_B_D_h_w)
-
-        LT2_out_B_D_1_1 = LT2_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        LT2_out_B_D_1_w = self.linearh(LT2_out_B_D_1_1)
-        LT2_out_B_D_1_h = self.linearh(LT2_out_B_D_1_1)
-        LT2_out_B_D_h_1 = LT2_out_B_D_1_h.view(b,c,h,1)
-        LT2_out_B_D_h_w = LT2_out_B_D_h_1 * LT2_out_B_D_1_w
-        LT2_out_B_D_h_w_sigmoid = self.sigmoid(LT2_out_B_D_h_w)
-
-        LT3_out_B_D_1_1 = LT3_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        LT3_out_B_D_1_w = self.linearh(LT3_out_B_D_1_1)
-        LT3_out_B_D_1_h = self.linearh(LT3_out_B_D_1_1)
-        LT3_out_B_D_h_1 = LT3_out_B_D_1_h.view(b,c,h,1)
-        LT3_out_B_D_h_w = LT3_out_B_D_h_1 * LT3_out_B_D_1_w
-        LT3_out_B_D_h_w_sigmoid = self.sigmoid(LT3_out_B_D_h_w)
-
-        LT4_out_B_D_1_1 = LT4_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        LT4_out_B_D_1_w = self.linearh(LT4_out_B_D_1_1)
-        LT4_out_B_D_1_h = self.linearh(LT4_out_B_D_1_1)
-        LT4_out_B_D_h_1 = LT4_out_B_D_1_h.view(b,c,h,1)
-        LT4_out_B_D_h_w = LT4_out_B_D_h_1 * LT4_out_B_D_1_w
-        LT4_out_B_D_h_w_sigmoid = self.sigmoid(LT4_out_B_D_h_w)
-
-        x11_LT1_B_D_h_w = x11_out_B_D_h_w * LT1_out_B_D_h_w_sigmoid
-        x12_LT2_B_D_h_w = x12_out_B_D_h_w * LT2_out_B_D_h_w_sigmoid
-        x21_LT3_B_D_h_w = x21_out_B_D_h_w * LT3_out_B_D_h_w_sigmoid
-        x22_LT4_B_D_h_w = x22_out_B_D_h_w * LT4_out_B_D_h_w_sigmoid
-
-        x1_out = torch.cat([x11_LT1_B_D_h_w,x12_LT2_B_D_h_w], dim=3)
-        x2_out = torch.cat([x21_LT3_B_D_h_w,x22_LT4_B_D_h_w], dim=3)
-        x_LT_out = torch.cat([x1_out, x2_out ], dim=2)
-
-        x_LT_out_B_D_HW = x_LT_out.contiguous().view(b, c, -1)
-        GT_out_B_D_4H = GT_out_B_D_4_H.contiguous().view(b, c, -1)
-        GT_out_B_4H_D = GT_out_B_D_4H.contiguous().permute(0, 2, 1)
-        GT_B_4H_HW = torch.bmm(torch.relu(GT_out_B_4H_D), torch.relu(x_LT_out_B_D_HW))
-        GT_B_4H_HW_ = GT_B_4H_HW / 2
-        d = torch.sum(GT_B_4H_HW_, dim=1)
-        d[d != 0] = torch.sqrt(1.0 / d[d != 0])
-        GT_B_4H_HW_ *= d.unsqueeze(1)
-        GT_out_B_D_HW = torch.bmm(GT_out_B_D_4H, GT_B_4H_HW_)
-
-        GT_out_B_D_H_W = GT_out_B_D_HW.contiguous().view(b, c, H, W)
-
-        x_LT_GT_out = x_LT_out + GT_out_B_D_H_W
-
-        x_cat = torch.cat([residual,x_LT_GT_out], dim=1)
-        x_out = self.conv1_2ch_1ch(x_cat)
-        x_out = self.bn(x_out)
-        x_out = torch.relu(x_out)
-        x_out = self.convout(x_out)
-        x_out = self.bnout(x_out)
-        x_out = torch.relu(x_out)
-
-        out = x_out
-
-
+        out = torch.matmul(attn, v)
+        out = out.permute(0, 2, 1).contiguous().view(B, C, H, W)
         return out
 
-
-class DTA512(nn.Module):
-    def __init__(self, inplanes,planes):
-        super(DTA512, self).__init__()
-        self.q = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
-        self.k = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
-        self.v = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
-
-        self.conv1_2ch_1ch = nn.Conv2d(planes + inplanes, planes, kernel_size=1, stride=1)
-        # self.conv1_4ch_1ch = nn.Conv2d(planes * 4, planes, kernel_size=1, stride=1)
-        self.conv1_1ch_1ch = nn.Conv2d(inplanes,inplanes, kernel_size=1, stride=1)
-        self.convout = nn.Conv2d(planes, inplanes, kernel_size=3, stride=1, padding=1)
-        self.bnout = nn.BatchNorm2d(inplanes)
-        # self.bn2ch = nn.BatchNorm2d(planes * 2)
-        self.bn = nn.BatchNorm2d(planes)
-
-        self.linearh = nn.Linear(1, 16)
-        self.linearH = nn.Linear(1, 32)
-        self.avg_down = nn.AdaptiveAvgPool2d((1, 1))
-        self.sigmoid = nn.Sigmoid()
-
-        self.GLTATT = GLTATT(512)
-
-    def forward(self,x):
-        residual = x
-        b, c, H, W = x.size()
-
-        GT_B_D_1_1 = self.avg_down(x)  # BD11
-
-        x_ = torch.chunk(x, 2, dim=2)
-        x1_ = x_[0]
-        x2_ = x_[1]
-        x1_12_ = torch.chunk(x1_, 2, dim=3)
-        x11_ = x1_12_[0]
-        x12_ = x1_12_[1]
-        x2_12_ = torch.chunk(x2_, 2, dim=3)
-        x21_ = x2_12_[0]
-        x22_ = x2_12_[1]
-
-        x11_b, x11_c, h, w = x11_.size()
-
-        LT1_B_D_1_1 = self.avg_down(x11_)  # BD11
-        LT2_B_D_1_1 = self.avg_down(x12_)
-        LT3_B_D_1_1 = self.avg_down(x21_)
-        LT4_B_D_1_1 = self.avg_down(x22_)
-
-        GT_B_D_1 = GT_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
-        LT1_B_D_1 = LT1_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
-        LT2_B_D_1 = LT2_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
-        LT3_B_D_1 = LT3_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
-        LT4_B_D_1 = LT4_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
-
-        x11_B_D_hw = x11_.contiguous().view(x11_b, x11_c, -1)
-        x12_B_D_hw = x12_.contiguous().view(x11_b, x11_c, -1)
-        x21_B_D_hw = x21_.contiguous().view(x11_b, x11_c, -1)
-        x22_B_D_hw = x22_.contiguous().view(x11_b, x11_c, -1)
-
-        x11_B_D_hwLG = torch.cat([x11_B_D_hw, LT1_B_D_1, GT_B_D_1], dim=2)
-        x12_B_D_hwLG = torch.cat([x12_B_D_hw, LT2_B_D_1, GT_B_D_1], dim=2)
-        x21_B_D_hwLG = torch.cat([x21_B_D_hw, LT3_B_D_1, GT_B_D_1], dim=2)
-        x22_B_D_hwLG = torch.cat([x22_B_D_hw, LT4_B_D_1, GT_B_D_1], dim=2)
-
-
-        ######################### 
-        x11_B_D_hwLG_out = self.GLTATT(x11_B_D_hwLG)
-        x12_B_D_hwLG_out = self.GLTATT(x12_B_D_hwLG)
-        x21_B_D_hwLG_out = self.GLTATT(x21_B_D_hwLG)
-        x22_B_D_hwLG_out = self.GLTATT(x22_B_D_hwLG)
-
-
-
-
-
-
-
-        x11_out_B_D_hw, LT1_out_B_D_1, GT1_out_B_D_1 = torch.split(x11_B_D_hwLG_out, [h*w, 1, 1], dim=2)
-        x12_out_B_D_hw, LT2_out_B_D_1, GT2_out_B_D_1 = torch.split(x12_B_D_hwLG_out, [h*w, 1, 1], dim=2)
-        x21_out_B_D_hw, LT3_out_B_D_1, GT3_out_B_D_1 = torch.split(x21_B_D_hwLG_out, [h*w, 1, 1], dim=2)
-        x22_out_B_D_hw, LT4_out_B_D_1, GT4_out_B_D_1 = torch.split(x22_B_D_hwLG_out, [h*w, 1, 1], dim=2)
-
-        x11_out_B_D_h_w = x11_out_B_D_hw.view(b, c, h, w)
-        x12_out_B_D_h_w = x12_out_B_D_hw.view(b, c, h, w)
-        x21_out_B_D_h_w = x21_out_B_D_hw.view(b, c, h, w)
-        x22_out_B_D_h_w = x22_out_B_D_hw.view(b, c, h, w)
-
-
-
-        ########################## GT
-        GT1_out_B_D_1_1 = GT1_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        GT2_out_B_D_1_1 = GT2_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        GT3_out_B_D_1_1 = GT3_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        GT4_out_B_D_1_1 = GT4_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-
-
-        GT1_out_B_D_1_H = self.linearH(GT1_out_B_D_1_1)
-        GT2_out_B_D_1_H = self.linearH(GT2_out_B_D_1_1)
-        GT3_out_B_D_1_H = self.linearH(GT3_out_B_D_1_1)
-        GT4_out_B_D_1_H = self.linearH(GT4_out_B_D_1_1)
-
-
-        GT1234_out_B_D_4_H = torch.cat([GT1_out_B_D_1_H, GT2_out_B_D_1_H,GT3_out_B_D_1_H,GT4_out_B_D_1_H], dim=2)
-        GT_out_B_D_4_H = self.conv1_1ch_1ch(GT1234_out_B_D_4_H)
-
-
-        ########################## LT
-        LT1_out_B_D_1_1 = LT1_out_B_D_1.contiguous().view(x11_b, x11_c, 1, 1)
-        LT1_out_B_D_1_w = self.linearh(LT1_out_B_D_1_1)
-        LT1_out_B_D_1_h = self.linearh(LT1_out_B_D_1_1)
-        LT1_out_B_D_h_1 = LT1_out_B_D_1_h.view(b, c, h, 1)
-        LT1_out_B_D_h_w = LT1_out_B_D_h_1 * LT1_out_B_D_1_w
-        LT1_out_B_D_h_w_sigmoid = self.sigmoid(LT1_out_B_D_h_w)
-
-        LT2_out_B_D_1_1 = LT2_out_B_D_1.contiguous().view(x11_b, x11_c, 1, 1)
-        LT2_out_B_D_1_w = self.linearh(LT2_out_B_D_1_1)
-        LT2_out_B_D_1_h = self.linearh(LT2_out_B_D_1_1)
-        LT2_out_B_D_h_1 = LT2_out_B_D_1_h.view(b, c, h, 1)
-        LT2_out_B_D_h_w = LT2_out_B_D_h_1 * LT2_out_B_D_1_w
-        LT2_out_B_D_h_w_sigmoid = self.sigmoid(LT2_out_B_D_h_w)
-
-        LT3_out_B_D_1_1 = LT3_out_B_D_1.contiguous().view(x11_b, x11_c, 1, 1)
-        LT3_out_B_D_1_w = self.linearh(LT3_out_B_D_1_1)
-        LT3_out_B_D_1_h = self.linearh(LT3_out_B_D_1_1)
-        LT3_out_B_D_h_1 = LT3_out_B_D_1_h.view(b, c, h, 1)
-        LT3_out_B_D_h_w = LT3_out_B_D_h_1 * LT3_out_B_D_1_w
-        LT3_out_B_D_h_w_sigmoid = self.sigmoid(LT3_out_B_D_h_w)
-
-        LT4_out_B_D_1_1 = LT4_out_B_D_1.contiguous().view(x11_b, x11_c, 1, 1)
-        LT4_out_B_D_1_w = self.linearh(LT4_out_B_D_1_1)
-        LT4_out_B_D_1_h = self.linearh(LT4_out_B_D_1_1)
-        LT4_out_B_D_h_1 = LT4_out_B_D_1_h.view(b, c, h, 1)
-        LT4_out_B_D_h_w = LT4_out_B_D_h_1 * LT4_out_B_D_1_w
-        LT4_out_B_D_h_w_sigmoid = self.sigmoid(LT4_out_B_D_h_w)
-
-        x11_LT1_B_D_h_w = x11_out_B_D_h_w * LT1_out_B_D_h_w_sigmoid
-        x12_LT2_B_D_h_w = x12_out_B_D_h_w * LT2_out_B_D_h_w_sigmoid
-        x21_LT3_B_D_h_w = x21_out_B_D_h_w * LT3_out_B_D_h_w_sigmoid
-        x22_LT4_B_D_h_w = x22_out_B_D_h_w * LT4_out_B_D_h_w_sigmoid
-
-        x1_out = torch.cat([x11_LT1_B_D_h_w, x12_LT2_B_D_h_w], dim=3)
-        x2_out = torch.cat([x21_LT3_B_D_h_w, x22_LT4_B_D_h_w], dim=3)
-        x_LT_out = torch.cat([x1_out, x2_out], dim=2)
-
-        x_LT_out_B_D_HW = x_LT_out.contiguous().view(b, c, -1)
-        GT_out_B_D_4H = GT_out_B_D_4_H.contiguous().view(b, c, -1)
-        GT_out_B_4H_D = GT_out_B_D_4H.contiguous().permute(0, 2, 1)
-        GT_B_4H_HW = torch.bmm(torch.relu(GT_out_B_4H_D), torch.relu(x_LT_out_B_D_HW))
-        GT_B_4H_HW_ = GT_B_4H_HW / 2
-        d = torch.sum(GT_B_4H_HW_, dim=1)
-        d[d != 0] = torch.sqrt(1.0 / d[d != 0])
-        GT_B_4H_HW_ *= d.unsqueeze(1)
-        GT_out_B_D_HW = torch.bmm(GT_out_B_D_4H, GT_B_4H_HW_)
-
-        GT_out_B_D_H_W = GT_out_B_D_HW.contiguous().view(b, c, H, W)
-
-        x_LT_GT_out = x_LT_out + GT_out_B_D_H_W
-
-        x_cat = torch.cat([residual, x_LT_GT_out], dim=1)
-        x_out = self.conv1_2ch_1ch(x_cat)
-        x_out = self.bn(x_out)
-        x_out = torch.relu(x_out)
-        x_out = self.convout(x_out)
-        x_out = self.bnout(x_out)
-        x_out = torch.relu(x_out)
-
-        out = x_out
-
-        return out
-
-
-class DTA1024(nn.Module):
-    def __init__(self, inplanes,planes):
-        super(DTA1024, self).__init__()
-        self.q = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
-        self.k = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
-        self.v = nn.Conv2d(inplanes, planes, kernel_size=1, stride=1, bias=False)
-
-
-        self.conv1_2ch_1ch = nn.Conv2d(planes+inplanes, planes, kernel_size=1, stride=1)
-        # self.conv1_4ch_1ch= nn.Conv2d(planes*4, planes, kernel_size=1, stride=1)
-        self.conv1_1ch_1ch = nn.Conv2d(inplanes,inplanes, kernel_size=1, stride=1)
-        self.convout = nn.Conv2d(planes, inplanes, kernel_size=3, stride=1,padding=1)
-
-        #######bn
-        self.bnout = nn.BatchNorm2d(inplanes)
-        # self.bn2ch = nn.BatchNorm2d(planes * 2)
-        self.bn = nn.BatchNorm2d(planes)
-
-        self.linearh = nn.Linear(1, 8)
-        self.linearH = nn.Linear(1, 16)
-        self.avg_down = nn.AdaptiveAvgPool2d((1, 1))
-        self.sigmoid = nn.Sigmoid()
-
-        self.GLTATT = GLTATT(1024)
-
-    def forward(self,x):
-        residual = x
-        b, c, H, W = x.size()
-
-        GT_B_D_1_1 = self.avg_down(x)  # BD11
-
-        x_ = torch.chunk(x, 2, dim=2)
-        x1_ = x_[0]
-        x2_ = x_[1]
-        x1_12_ = torch.chunk(x1_, 2, dim=3)
-        x11_ = x1_12_[0]
-        x12_ = x1_12_[1]
-        x2_12_ = torch.chunk(x2_, 2, dim=3)
-        x21_ = x2_12_[0]
-        x22_ = x2_12_[1]
-
-        x11_b, x11_c, h, w = x11_.size()
-
-        LT1_B_D_1_1 = self.avg_down(x11_)  # BD11
-        LT2_B_D_1_1 = self.avg_down(x12_)
-        LT3_B_D_1_1 = self.avg_down(x21_)
-        LT4_B_D_1_1 = self.avg_down(x22_)
-
-        GT_B_D_1 = GT_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
-        LT1_B_D_1 = LT1_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
-        LT2_B_D_1 = LT2_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
-        LT3_B_D_1 = LT3_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
-        LT4_B_D_1 = LT4_B_D_1_1.contiguous().view(x11_b, x11_c, -1)
-
-        x11_B_D_hw = x11_.contiguous().view(x11_b, x11_c, -1)
-        x12_B_D_hw = x12_.contiguous().view(x11_b, x11_c, -1)
-        x21_B_D_hw = x21_.contiguous().view(x11_b, x11_c, -1)
-        x22_B_D_hw = x22_.contiguous().view(x11_b, x11_c, -1)
-
-        x11_B_D_hwLG = torch.cat([x11_B_D_hw, LT1_B_D_1, GT_B_D_1], dim=2)
-        x12_B_D_hwLG = torch.cat([x12_B_D_hw, LT2_B_D_1, GT_B_D_1], dim=2)
-        x21_B_D_hwLG = torch.cat([x21_B_D_hw, LT3_B_D_1, GT_B_D_1], dim=2)
-        x22_B_D_hwLG = torch.cat([x22_B_D_hw, LT4_B_D_1, GT_B_D_1], dim=2)
-
-
-        ######################### 
-        x11_B_D_hwLG_out = self.GLTATT(x11_B_D_hwLG)
-        x12_B_D_hwLG_out = self.GLTATT(x12_B_D_hwLG)
-        x21_B_D_hwLG_out = self.GLTATT(x21_B_D_hwLG)
-        x22_B_D_hwLG_out = self.GLTATT(x22_B_D_hwLG)
-
-
-        x11_out_B_D_hw, LT1_out_B_D_1, GT1_out_B_D_1 = torch.split(x11_B_D_hwLG_out, [h*w, 1, 1], dim=2)
-        x12_out_B_D_hw, LT2_out_B_D_1, GT2_out_B_D_1 = torch.split(x12_B_D_hwLG_out, [h*w, 1, 1], dim=2)
-        x21_out_B_D_hw, LT3_out_B_D_1, GT3_out_B_D_1 = torch.split(x21_B_D_hwLG_out, [h*w, 1, 1], dim=2)
-        x22_out_B_D_hw, LT4_out_B_D_1, GT4_out_B_D_1 = torch.split(x22_B_D_hwLG_out, [h*w, 1, 1], dim=2)
-
-        x11_out_B_D_h_w = x11_out_B_D_hw.view(b, c, h, w)
-        x12_out_B_D_h_w = x12_out_B_D_hw.view(b, c, h, w)
-        x21_out_B_D_h_w = x21_out_B_D_hw.view(b, c, h, w)
-        x22_out_B_D_h_w = x22_out_B_D_hw.view(b, c, h, w)
-
-        ########################## GT
-
-        GT1_out_B_D_1_1 = GT1_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        GT2_out_B_D_1_1 = GT2_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        GT3_out_B_D_1_1 = GT3_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-        GT4_out_B_D_1_1 = GT4_out_B_D_1.contiguous().view(x11_b, x11_c, 1,1)
-
-        GT1_out_B_D_1_H = self.linearH(GT1_out_B_D_1_1)
-        GT2_out_B_D_1_H = self.linearH(GT2_out_B_D_1_1)
-        GT3_out_B_D_1_H = self.linearH(GT3_out_B_D_1_1)
-        GT4_out_B_D_1_H = self.linearH(GT4_out_B_D_1_1)
-
-        GT1234_out_B_D_4_H = torch.cat([GT1_out_B_D_1_H, GT2_out_B_D_1_H,GT3_out_B_D_1_H,GT4_out_B_D_1_H], dim=2)
-        GT_out_B_D_4_H = self.conv1_1ch_1ch(GT1234_out_B_D_4_H)
-
-
-        ########################## LT
-        LT1_out_B_D_1_1 = LT1_out_B_D_1.contiguous().view(x11_b, x11_c, 1, 1)
-        LT1_out_B_D_1_w = self.linearh(LT1_out_B_D_1_1)
-        LT1_out_B_D_1_h = self.linearh(LT1_out_B_D_1_1)
-        LT1_out_B_D_h_1 = LT1_out_B_D_1_h.view(b, c, h, 1)
-        LT1_out_B_D_h_w = LT1_out_B_D_h_1 * LT1_out_B_D_1_w
-        LT1_out_B_D_h_w_sigmoid = self.sigmoid(LT1_out_B_D_h_w)
-
-        LT2_out_B_D_1_1 = LT2_out_B_D_1.contiguous().view(x11_b, x11_c, 1, 1)
-        LT2_out_B_D_1_w = self.linearh(LT2_out_B_D_1_1)
-        LT2_out_B_D_1_h = self.linearh(LT2_out_B_D_1_1)
-        LT2_out_B_D_h_1 = LT2_out_B_D_1_h.view(b, c, h, 1)
-        LT2_out_B_D_h_w = LT2_out_B_D_h_1 * LT2_out_B_D_1_w
-        LT2_out_B_D_h_w_sigmoid = self.sigmoid(LT2_out_B_D_h_w)
-
-        LT3_out_B_D_1_1 = LT3_out_B_D_1.contiguous().view(x11_b, x11_c, 1, 1)
-        LT3_out_B_D_1_w = self.linearh(LT3_out_B_D_1_1)
-        LT3_out_B_D_1_h = self.linearh(LT3_out_B_D_1_1)
-        LT3_out_B_D_h_1 = LT3_out_B_D_1_h.view(b, c, h, 1)
-        LT3_out_B_D_h_w = LT3_out_B_D_h_1 * LT3_out_B_D_1_w
-        LT3_out_B_D_h_w_sigmoid = self.sigmoid(LT3_out_B_D_h_w)
-
-        LT4_out_B_D_1_1 = LT4_out_B_D_1.contiguous().view(x11_b, x11_c, 1, 1)
-        LT4_out_B_D_1_w = self.linearh(LT4_out_B_D_1_1)
-        LT4_out_B_D_1_h = self.linearh(LT4_out_B_D_1_1)
-        LT4_out_B_D_h_1 = LT4_out_B_D_1_h.view(b, c, h, 1)
-        LT4_out_B_D_h_w = LT4_out_B_D_h_1 * LT4_out_B_D_1_w
-        LT4_out_B_D_h_w_sigmoid = self.sigmoid(LT4_out_B_D_h_w)
-
-        x11_LT1_B_D_h_w = x11_out_B_D_h_w * LT1_out_B_D_h_w_sigmoid
-        x12_LT2_B_D_h_w = x12_out_B_D_h_w * LT2_out_B_D_h_w_sigmoid
-        x21_LT3_B_D_h_w = x21_out_B_D_h_w * LT3_out_B_D_h_w_sigmoid
-        x22_LT4_B_D_h_w = x22_out_B_D_h_w * LT4_out_B_D_h_w_sigmoid
-
-        x1_out = torch.cat([x11_LT1_B_D_h_w, x12_LT2_B_D_h_w], dim=3)
-        x2_out = torch.cat([x21_LT3_B_D_h_w, x22_LT4_B_D_h_w], dim=3)
-        x_LT_out = torch.cat([x1_out, x2_out], dim=2)
-
-        x_LT_out_B_D_HW = x_LT_out.contiguous().view(b, c, -1)
-        GT_out_B_D_4H = GT_out_B_D_4_H.contiguous().view(b, c, -1)
-        GT_out_B_4H_D = GT_out_B_D_4H.contiguous().permute(0, 2, 1)
-        GT_B_4H_HW = torch.bmm(torch.relu(GT_out_B_4H_D),torch.relu(x_LT_out_B_D_HW))
-        GT_B_4H_HW_ = GT_B_4H_HW/2
-        d = torch.sum(GT_B_4H_HW_,dim=1)
-        d[d !=0]= torch.sqrt(1.0/d[d !=0])
-        GT_B_4H_HW_ *= d.unsqueeze(1)
-        GT_out_B_D_HW = torch.bmm(GT_out_B_D_4H, GT_B_4H_HW_)
-
-
-        GT_out_B_D_H_W = GT_out_B_D_HW.contiguous().view(b, c, H,W)
-
-
-
-        x_LT_GT_out = x_LT_out + GT_out_B_D_H_W
-
-        x_cat = torch.cat([residual, x_LT_GT_out], dim=1)
-        x_out = self.conv1_2ch_1ch(x_cat)
-        x_out = self.bn(x_out)
-        x_out = torch.relu(x_out)
-        x_out = self.convout(x_out)
-        x_out = self.bnout(x_out)
-        x_out = torch.relu(x_out)
-
-        out = x_out
-
-        return out
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, pad_hw = self._pad_to_even(x)
+
+        B, C, H, W = x.shape
+        h, w = H // 2, W // 2
+        assert h == self.linear_h_dim and w == self.linear_h_dim, "window size must equal linear_h_dim"
+        assert H == self.linear_H_dim, "H must equal linear_H_dim"
+
+        gt = self.avg_pool(x).view(B, C, -1)
+
+        x_top, x_bottom = torch.chunk(x, 2, dim=2)
+        x11, x12 = torch.chunk(x_top, 2, dim=3)
+        x21, x22 = torch.chunk(x_bottom, 2, dim=3)
+        quads = [x11, x12, x21, x22]
+
+        x_out_quads = []
+        gt_tokens = []
+
+        for q_map in quads:
+            lt_i = self.avg_pool(q_map).view(B, C, -1)
+            x_hw = q_map.reshape(B, C, -1)
+            y_in = torch.cat([x_hw, lt_i, gt], dim=2)
+            y_out = self._local_mhsa(y_in)
+
+            x_prime, lt_prime, gt_prime = torch.split(y_out, [h * w, 1, 1], dim=2)
+            x_prime_map = x_prime.view(B, C, h, w)
+            lt_prime_1_1 = lt_prime.view(B, C, 1, 1)
+            gt_prime_1_1 = gt_prime.view(B, C, 1, 1)
+
+            w_lt = self._local_token_upsample(lt_prime_1_1, h, w)
+            x_weighted = x_prime_map * w_lt
+
+            x_out_quads.append(x_weighted)
+            gt_tokens.append(gt_prime)
+
+        top = torch.cat([x_out_quads[0], x_out_quads[1]], dim=3)
+        bottom = torch.cat([x_out_quads[2], x_out_quads[3]], dim=3)
+        f_wlt = torch.cat([top, bottom], dim=2)
+
+        f_wgt = self._global_token_attention(f_wlt, gt_tokens, H, W)
+        f_out = f_wlt + f_wgt
+
+        f_out = self._crop(f_out, pad_hw)
+        return f_out
+
+
+class DTA256(BaseDTA):
+    def __init__(self, inplanes: int, num_heads: int = 4, dropout: float = 0.0):
+        super().__init__(inplanes=inplanes,
+                         linear_h_dim=32,
+                         linear_H_dim=64,
+                         num_heads=num_heads,
+                         dropout=dropout)
+
+
+class DTA512(BaseDTA):
+    def __init__(self, inplanes: int, num_heads: int = 4, dropout: float = 0.0):
+        super().__init__(inplanes=inplanes,
+                         linear_h_dim=16,
+                         linear_H_dim=32,
+                         num_heads=num_heads,
+                         dropout=dropout)
+
+
+class DTA1024(BaseDTA):
+    def __init__(self, inplanes: int, num_heads: int = 4, dropout: float = 0.0):
+        super().__init__(inplanes=inplanes,
+                         linear_h_dim=8,
+                         linear_H_dim=16,
+                         num_heads=num_heads,
+                         dropout=dropout)
