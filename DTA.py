@@ -108,7 +108,7 @@ class BaseDTA(nn.Module):
 
     def _global_token_attention(self, f_wlt: torch.Tensor, gt_tokens_list, H: int, W: int) -> torch.Tensor:
         B, C, _, _ = f_wlt.shape
-        assert H == self.linear_H_dim, "H must match linear_H_dim for GT expansion"
+        assert H == self.linear_H_dim and W == self.linear_H_dim, "window size must match linear_H_dim"
 
         gt_expanded = []
         for gt_i in gt_tokens_list:
@@ -138,7 +138,7 @@ class BaseDTA(nn.Module):
         B, C, H, W = x.shape
         h, w = H // 2, W // 2
         assert h == self.linear_h_dim and w == self.linear_h_dim, "window size must equal linear_h_dim"
-        assert H == self.linear_H_dim, "H must equal linear_H_dim"
+        assert H == self.linear_H_dim and W == self.linear_H_dim, "window size must match linear_H_dim"
 
         gt = self.avg_pool(x).view(B, C, -1)
 
